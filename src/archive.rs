@@ -35,14 +35,18 @@ pub struct Entries<'a, R: 'a + Read> {
     _ignored: marker::PhantomData<&'a Archive<R>>,
 }
 
+trait SeekRead: Read + Seek {}
+impl<R: Read + Seek> SeekRead for R {}
+
 struct EntriesFields<'a> {
     archive: &'a Archive<dyn Read + 'a>,
+    seekable_archive: Option<&'a Archive<dyn SeekRead + 'a>>,
     next: u64,
     done: bool,
     raw: bool,
 }
 
-impl<R: Read> Archive<R> {
+impl<'a, R: Read> Archive<R> {
     /// Create a new archive with the underlying object as the reader.
     pub fn new(obj: R) -> Archive<R> {
         Archive {
@@ -71,7 +75,7 @@ impl<R: Read> Archive<R> {
     /// corrupted.
     pub fn entries(&mut self) -> io::Result<Entries<R>> {
         let me: &mut Archive<dyn Read> = self;
-        me._entries().map(|fields| Entries {
+        me._entries(None).map(|fields| Entries {
             fields: fields,
             _ignored: marker::PhantomData,
         })
@@ -143,8 +147,29 @@ impl<R: Read> Archive<R> {
     }
 }
 
+impl<'a, R: Seek + Read> Archive<R> {
+    /// Construct an iterator over the entries in this archive for a seekable
+    /// reader. Seek will be used to efficiently skip over file contents.
+    ///
+    /// Note that care must be taken to consider each entry within an archive in
+    /// sequence. If entries are processed out of sequence (from what the
+    /// iterator returns), then the contents read for each entry may be
+    /// corrupted.
+    pub fn entries_with_seek(&mut self) -> io::Result<Entries<R>> {
+        let me: &Archive<dyn Read> = self;
+        let me_seekable: &Archive<dyn SeekRead> = self;
+        me._entries(Some(me_seekable)).map(|fields| Entries {
+            fields: fields,
+            _ignored: marker::PhantomData,
+        })
+    }
+}
+
 impl<'a> Archive<dyn Read + 'a> {
-    fn _entries(&mut self) -> io::Result<EntriesFields> {
+    fn _entries(
+        &'a self,
+        seekable_archive: Option<&'a Archive<dyn SeekRead + 'a>>,
+    ) -> io::Result<EntriesFields> {
         if self.inner.pos.get() != 0 {
             return Err(other(
                 "cannot call entries unless archive is at \
@@ -153,13 +178,14 @@ impl<'a> Archive<dyn Read + 'a> {
         }
         Ok(EntriesFields {
             archive: self,
+            seekable_archive,
             done: false,
             next: 0,
             raw: false,
         })
     }
 
-    fn _unpack(&mut self, dst: &Path) -> io::Result<()> {
+    fn _unpack(&'a mut self, dst: &Path) -> io::Result<()> {
         if dst.symlink_metadata().is_err() {
             fs::create_dir_all(&dst)
                 .map_err(|e| TarError::new(&format!("failed to create `{}`", dst.display()), e))?;
@@ -176,7 +202,7 @@ impl<'a> Archive<dyn Read + 'a> {
         // descendants), to ensure that directory permissions do not interfer with descendant
         // extraction.
         let mut directories = Vec::new();
-        for entry in self._entries()? {
+        for entry in self._entries(None)? {
             let mut file = entry.map_err(|e| TarError::new("failed to iterate over archive", e))?;
             if file.header().entry_type() == crate::EntryType::Directory {
                 directories.push(file);
@@ -202,6 +228,14 @@ impl<'a> Archive<dyn Read + 'a> {
             amt -= n as u64;
         }
         Ok(())
+    }
+}
+
+impl<'a> Archive<dyn SeekRead + 'a> {
+    fn skip_with_seek(&self, amt: u64) -> io::Result<()> {
+        (&self.inner)
+            .seek(io::SeekFrom::Current(amt as i64))
+            .map(|_| ())
     }
 }
 
@@ -241,7 +275,11 @@ impl<'a> EntriesFields<'a> {
         loop {
             // Seek to the start of the next header in the archive
             let delta = self.next - self.archive.inner.pos.get();
-            self.archive.skip(delta)?;
+            if let Some(seekable_archive) = self.seekable_archive {
+                seekable_archive.skip_with_seek(delta)?;
+            } else {
+                self.archive.skip(delta)?;
+            }
 
             // EOF is an indicator that we are at the end of the archive.
             if !try_read_all(&mut &self.archive.inner, header.as_mut_bytes())? {
@@ -504,6 +542,15 @@ impl<'a, R: ?Sized + Read> Read for &'a ArchiveInner<R> {
     fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
         self.obj.borrow_mut().read(into).map(|i| {
             self.pos.set(self.pos.get() + i as u64);
+            i
+        })
+    }
+}
+
+impl<'a, R: ?Sized + Seek> Seek for &'a ArchiveInner<R> {
+    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+        self.obj.borrow_mut().seek(pos).map(|i| {
+            self.pos.set(i);
             i
         })
     }

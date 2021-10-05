@@ -153,6 +153,48 @@ fn writing_files() {
     assert!(entries.next().is_none());
 }
 
+struct LoggingReader<R> {
+    inner: R,
+    read_bytes: u64,
+}
+
+impl<R> LoggingReader<R> {
+    fn new(reader: R) -> LoggingReader<R> {
+        LoggingReader {
+            inner: reader,
+            read_bytes: 0,
+        }
+    }
+}
+
+impl<T: Read> Read for LoggingReader<T> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf).map(|i| {
+            self.read_bytes += i as u64;
+            i
+        })
+    }
+}
+
+impl<T: Seek> Seek for LoggingReader<T> {
+    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+#[test]
+fn new_from_seek() {
+    let mut reader = LoggingReader::new(Cursor::new(tar!("reading_files.tar")));
+    let mut ar_reader = Archive::new(&mut reader);
+    for _ in t!(ar_reader.entries()) {}
+    assert!(reader.read_bytes == 2560);
+
+    let mut seekable_reader = LoggingReader::new(Cursor::new(tar!("reading_files.tar")));
+    let mut ar_seekable_reader = Archive::new(&mut seekable_reader);
+    for _ in t!(ar_seekable_reader.entries_with_seek()) {}
+    assert!(seekable_reader.read_bytes == 1536);
+}
+
 #[test]
 fn large_filename() {
     let mut ar = Builder::new(Vec::new());
